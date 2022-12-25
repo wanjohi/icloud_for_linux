@@ -44,14 +44,11 @@ downQueue = Queue()
 syncQueue = Queue()
 
 # Inotify flags to watch
-watch_flags = flags.DELETE | flags.DELETE_SELF
+watch_flags = flags.DELETE | flags.DELETE_SELF | flags.MOVED_FROM | flags.MOVE_SELF
 iNotice = INotify()
 
 # Map of inotify watch ids
 inotifyMap = {}
-
-# Recently downloaded files to ignore inotify watches
-inotifyIgnore = []
 
 # Paths already watching
 activeWatch = []
@@ -62,6 +59,9 @@ maxThreads = 5
 # Files currently being worked on
 lock = threading.RLock()
 lockedFiles = []
+
+# Lock to avoid concurrent uploads
+uploadlock = threading.RLock()
 
 def downloadWorker():
     """ Worker to downloader files from icloud"""
@@ -91,9 +91,6 @@ def downloadWorker():
                         LOGGER.debug(f"{node_path} is up to date")
                         continue
 
-                # Lets get inotify not to trigger on this node path
-                inotifyIgnore.append(node_path)
-
                 # Download the file
                 LOGGER.info(f"Downloading: {node_path}")
 
@@ -112,7 +109,6 @@ def downloadWorker():
                 if not nodeExist:
                     # Lets get inotify not to trigger on this node path
                     LOGGER.info(f"Dir doesn't existing, creating: {node_path}")
-                    inotifyIgnore.append(node_path)
                     os.makedirs(node_path)
                 
                 if node_path not in activeWatch:
@@ -174,7 +170,8 @@ def syncWorker(root):
                     continue
                 except (KeyError, IndexError):
                     LOGGER.info(f"Sync Worker Uploading missing node: {obj}")
-                    createNode(obj, node)
+                    with uploadlock:
+                        createNode(obj, node)
                     newNode = True
                     break
             
@@ -188,7 +185,8 @@ def syncWorker(root):
                     # Our file is newer, upload it
                     LOGGER.info(f"Sync Worker Local file is newer: {obj}")
                     LOGGER.debug(f"node time: {nodeTime.strftime('%m/%d/%Y, %H:%M:%S %Z')}, local file : {fileTime.strftime('%m/%d/%Y, %H:%M:%S %Z')}")
-                    modifyNode(obj, parentNode)
+                    with uploadlock:
+                        modifyNode(obj, parentNode)
             
             if os.path.isdir(obj):
                 # Add contained files/dir to queue
@@ -196,6 +194,9 @@ def syncWorker(root):
                     child = os.path.join(obj, filename)
                     LOGGER.debug(f"Sync Worker Adding to queue: {child}")
                     syncQueue.put(child)
+
+        except PyiCloudAPIResponseException:
+            LOGGER.info(f"Failed syncing: {obj}")
         finally:
             syncQueue.task_done()
             # Remove lock
@@ -316,8 +317,6 @@ def base(username, password):
     while(True):
         # If we finished downloading, lets check for new files in icloud drive
         if downQueue.empty():
-            # Reset the notify ignore list since we are done downloading
-            inotifyIgnore.clear()
             LOGGER.debug("Download queue is empty, restarting....")
 
             # Add root children to the download queue
@@ -332,15 +331,13 @@ def base(username, password):
                 obj = os.path.join(root_path, filename)
                 syncQueue.put(obj)
 
-        # Handle events of unblock after 10 mins so we can update the download queue
-        # with code above 600000
-        for event in iNotice.read(timeout=600000):
+        # Handle events of unblock after 5 mins so we can update the download queue
+        # with code above
+        for event in iNotice.read(timeout=300000):
             wd, _, _,  filename = event
             # Get the node information
             node, node_path = inotifyMap[wd]
-
-            if node_path not in inotifyIgnore:
-                handleEvent(wd, flags.from_mask(event.mask), node, node_path, filename)
+            handleEvent(wd, flags.from_mask(event.mask), node, node_path, filename)
 
     
 def handleEvent(wd, all_flags, node, node_path, filename):
@@ -350,11 +347,11 @@ def handleEvent(wd, all_flags, node, node_path, filename):
         LOGGER.info(f"Event occurred: {str(flag)}")
 
     try:
-        if flags.DELETE in all_flags:
+        if any(f in all_flags for f in [flags.DELETE, flags.MOVED_FROM]):
             LOGGER.debug(f"Deleting: {node[filename].name}")
             node[filename].delete()
 
-        elif flags.DELETE_SELF in all_flags:
+        elif any(f in all_flags for f in [flags.DELETE_SELF , flags.MOVE_SELF]):
             LOGGER.debug(f"Deleting: {node.name}")
             iNotice.rm_watch(wd)
             node.delete()
