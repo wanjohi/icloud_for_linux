@@ -1,0 +1,10 @@
+[Unit]
+Description=Icloud For Linux
+
+[Service]
+Type=simple
+ExecStart=/path/to/icloud --username=your_email@icloud.com --non-interactive
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
