@@ -32,7 +32,7 @@ LOGGER.setLevel(logging.INFO)
 
 
 # Cookies path
-cookie_file_path = ".cookies"
+cookie_file_path = "~/.local/share/icloud_for_linux/"
 
 root_name = "icloud"
 root_path = os.path.join(Path.home(), root_name)
