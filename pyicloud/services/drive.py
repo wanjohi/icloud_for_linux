@@ -265,11 +265,10 @@ class DriveNode:
         self.data.update(self.connection.get_node_data(self.data["docwsid"]))
         if "items" not in self.data:
             raise KeyError("No items in folder, status: %s" % self.data["status"])
-        if not self._children:  
-            self._children = [
-                DriveNode(self.connection, item_data)
-                for item_data in self.data["items"]
-            ]
+        self._children = [
+            DriveNode(self.connection, item_data)
+            for item_data in self.data["items"]
+        ]
         return self._children
 
     @property

@@ -31,7 +31,6 @@ LOGGER.addHandler(ch)
 LOGGER.setLevel(logging.INFO)
 
 
-
 # Cookies path
 cookie_file_path = ".cookies"
 
@@ -60,6 +59,7 @@ activeWatch = []
 # Number of threads for each worker
 maxThreads = 5
 
+# Files currently being worked on
 lock = threading.RLock()
 lockedFiles = []
 
@@ -117,7 +117,7 @@ def downloadWorker():
                 
                 if node_path not in activeWatch:
                     # If we already created a watch, don't create another
-                    LOGGER.info(f"Watching: {node_path}")
+                    LOGGER.debug(f"Watching: {node_path}")
                     wd = iNotice.add_watch(node_path, watch_flags)
                     inotifyMap[wd] = (node, node_path)
                     activeWatch.append(node_path)
@@ -187,7 +187,7 @@ def syncWorker(root):
                 if nodeTime < fileTime:
                     # Our file is newer, upload it
                     LOGGER.info(f"Sync Worker Local file is newer: {obj}")
-                    LOGGER.info(f"node time: {nodeTime.strftime('%m/%d/%Y, %H:%M:%S %Z')}, local file : {fileTime.strftime('%m/%d/%Y, %H:%M:%S %Z')}")
+                    LOGGER.debug(f"node time: {nodeTime.strftime('%m/%d/%Y, %H:%M:%S %Z')}, local file : {fileTime.strftime('%m/%d/%Y, %H:%M:%S %Z')}")
                     modifyNode(obj, parentNode)
             
             if os.path.isdir(obj):
@@ -235,17 +235,21 @@ def modifyNode (file_path, node):
             # Lets skip if file is empty, we can't upload 0 bytes files
             # We should catch it with the close write event
             if os.path.getsize(file_path) < 1:
-                LOGGER.info(f"{file_path} was size 0 skipping")
+                LOGGER.warn(f"{file_path} was size 0 skipping")
                 return
                 
             # Move original file to trash, then upload edited file
-            LOGGER.info(f"Modify node deleting old: {filename}")
+            LOGGER.debug(f"Modify node deleting old: {filename}")
             data = node[filename].delete()
-            LOGGER.info(f"Data {data}")
+            LOGGER.debug(f"Data: {data}")
+            
+            if data['items'][0]["status"] != "OK":
+                LOGGER.error(f"Failed to delete: {filename}")
+                return
 
-            time.sleep(30)
+            time.sleep(1)
 
-            LOGGER.info(f"Modify node uploading new: {file_path}")
+            LOGGER.debug(f"Modify node uploading new: {file_path}")
             with open(file_path, 'rb') as file_in:
                 node.upload(file_in)
 
@@ -280,7 +284,7 @@ def base(username, password):
         LOGGER.info("Fetch root node details")
         root = api.drive.root
 
-        LOGGER.info(f"Watching: {root_path}")
+        LOGGER.debug(f"Watching: {root_path}")
         wd = iNotice.add_watch(root_path, watch_flags)
         inotifyMap[wd] = (root, root_path)
         activeWatch.append(root_path)
@@ -314,23 +318,23 @@ def base(username, password):
         if downQueue.empty():
             # Reset the notify ignore list since we are done downloading
             inotifyIgnore.clear()
+            LOGGER.debug("Download queue is empty, restarting....")
 
             # Add root children to the download queue
             for child in root.get_children():
-                LOGGER.info("Download queue is empty, restarting....")
                 LOGGER.debug(f"Adding to download list: icloud/{child.name}")
                 downQueue.put((child, os.path.join(root_path, child.name)))
 
         # If we finished with the sync queue restart it
         if syncQueue.empty():
-            LOGGER.info("Sync queue is empty, restarting....")
+            LOGGER.debug("Sync queue is empty, restarting....")
             for filename in os.listdir(root_path):
                 obj = os.path.join(root_path, filename)
                 syncQueue.put(obj)
 
         # Handle events of unblock after 10 mins so we can update the download queue
-        # with code above
-        for event in iNotice.read(timeout=600000, read_delay=1):
+        # with code above 600000
+        for event in iNotice.read(timeout=600000):
             wd, _, _,  filename = event
             # Get the node information
             node, node_path = inotifyMap[wd]
