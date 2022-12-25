@@ -1,6 +1,6 @@
 import os
 import sys
-import datetime
+from datetime import datetime, timezone
 import logging
 import time
 import argparse
@@ -8,12 +8,29 @@ from pathlib import Path
 from pyicloud.base import PyiCloudService
 from pyicloud.exceptions import PyiCloudAPIResponseException
 from pyicloud.utils import store_password_in_keyring, get_password, password_exists_in_keyring
-from queue import Queue, Empty
+from queue import Queue
 import threading
 from shutil import copyfileobj
 from inotify_simple import INotify, flags
 
-LOGGER = logging.getLogger("pyicloud")
+# create console handler and set level to debug
+ch = logging.StreamHandler(sys.stdout)
+ch.setLevel(logging.INFO)
+
+# create formatter
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+# add formatter to ch
+ch.setFormatter(formatter)
+
+# Use the pyicloud logger
+LOGGER = logging.getLogger()
+
+# add ch to logger
+LOGGER.addHandler(ch)
+LOGGER.setLevel(logging.INFO)
+
+
 
 # Cookies path
 cookie_file_path = ".cookies"
@@ -23,6 +40,9 @@ root_path = os.path.join(Path.home(), root_name)
 
 # Download queue
 downQueue = Queue()
+
+# Sync queue
+syncQueue = Queue()
 
 # Inotify flags to watch
 watch_flags = flags.DELETE | flags.DELETE_SELF
@@ -37,20 +57,37 @@ inotifyIgnore = []
 # Paths already watching
 activeWatch = []
 
+# Number of threads for each worker
+maxThreads = 5
+
+lock = threading.RLock()
+lockedFiles = []
+
 def downloadWorker():
     """ Worker to downloader files from icloud"""
     while(True):
         # Download
         node, node_path  = downQueue.get()
         nodeExist = os.path.exists(node_path)
+        gotFileLock = False
 
         try:
+            # Lock the file since we are working on it
+            with lock:
+                if node_path not in lockedFiles:
+                    lockedFiles.append(node_path)
+                    gotFileLock = True
+                else:
+                    # Someone is already here, move on
+                    continue
+
             if node.type == "file":
                 if nodeExist:
                     # Check if the cloud file is newer
-                    modTime = os.path.getctime(node_path)
-                    utcModTime = datetime.datetime.utcfromtimestamp(modTime)
-                    if node.date_modified <= utcModTime:
+                    fileTime = os.path.getmtime(node_path)
+                    fileTime = datetime.fromtimestamp(fileTime, timezone.utc)
+                    nodeTime = node.date_modified.replace(tzinfo=timezone.utc)
+                    if nodeTime <= fileTime:
                         LOGGER.debug(f"{node_path} is up to date")
                         continue
 
@@ -58,27 +95,32 @@ def downloadWorker():
                 inotifyIgnore.append(node_path)
 
                 # Download the file
-                LOGGER.debug(f"Downloading: {node_path}")
+                LOGGER.info(f"Downloading: {node_path}")
+
                 with node.open(stream=True) as response:
                     with open(node_path, 'wb') as file_out:
                         copyfileobj(response.raw, file_out)
                 
                 # Set the correct timestamps
-                os.utime(node_path, (node.date_changed.timestamp(), node.date_modified.timestamp()))
-            else:
-                if node_path not in activeWatch:
-                    # If we already created a watch, don't create another
-                    LOGGER.debug(f"Watching: {node_path}")
-                    wd = iNotice.add_watch(node_path, watch_flags)
-                    inotifyMap[wd] = (node, node_path)
-                    activeWatch.append(node_path)
+                accessTime = node.date_changed.replace(tzinfo=timezone.utc)
+                modTime = node.date_modified.replace(tzinfo=timezone.utc)
+                LOGGER.debug(f"mod time: {node.date_modified.strftime('%m/%d/%Y, %H:%M:%S %Z')}, access time : {node.date_changed.strftime('%m/%d/%Y, %H:%M:%S %Z')}")
+                os.utime(node_path, times=(accessTime.timestamp(), modTime.timestamp()))
 
+            else:
                 # Create folder if it doesn't exist
                 if not nodeExist:
                     # Lets get inotify not to trigger on this node path
-                    LOGGER.debug(f"Dir doesn't existing, creating: {node_path}")
+                    LOGGER.info(f"Dir doesn't existing, creating: {node_path}")
                     inotifyIgnore.append(node_path)
                     os.makedirs(node_path)
+                
+                if node_path not in activeWatch:
+                    # If we already created a watch, don't create another
+                    LOGGER.info(f"Watching: {node_path}")
+                    wd = iNotice.add_watch(node_path, watch_flags)
+                    inotifyMap[wd] = (node, node_path)
+                    activeWatch.append(node_path)
                 
                 # Add children to the download queue
                 for child in node.get_children():
@@ -86,68 +128,81 @@ def downloadWorker():
                     downQueue.put((child, os.path.join(node_path, child.name)))
         finally:
             downQueue.task_done()
+            # Remove lock
+            with lock:
+                if gotFileLock:
+                    lockedFiles.remove(node_path)
             time.sleep(1)
     
 
 def syncWorker(root):
     """ Checks if local files still exist in icloud, deletes them if not"""
-    syncQueue = Queue()
 
-    while(True):
-        # Starting with root directory
-        for filename in os.listdir(root_path):
-            obj = os.path.join(root_path, filename)
-            syncQueue.put(obj)
+    # Work through all items in queue
+    while (True):
+        try:
+            obj = syncQueue.get()
+            gotFileLock = False
 
-        # Work through all items in queue
-        while (True):
-            try:
-                obj = syncQueue.get(False)
-
-                # Lets make sure the whole path wasn't delete in an earlier loop
-                if not os.path.exists(obj):
-                    LOGGER.debug(f"Sync worker can't find: {obj}")
+            # Lock the file since we are working on it
+            with lock:
+                if obj not in lockedFiles:
+                    lockedFiles.append(obj)
+                    gotFileLock = True
+                else:
+                    # Someone is already here, move on
                     continue
 
-                # We only want to split relative path
-                rel_path = str(obj).replace(str(root_path),"")
-                paths = list(filter(None, rel_path.split("/")))
-                LOGGER.debug(f"Sync Worker List of paths: {paths}")
+            # Lets make sure the whole path wasn't delete in an earlier loop
+            if not os.path.exists(obj):
+                LOGGER.warn(f"Sync worker can't find: {obj}")
+                continue
 
-                node = root
-                parentNode = None
-                for path in paths:
-                    try:
-                        # Node exists online, move on to the next
-                        parentNode = node
-                        node = node[path]
-                        continue
-                    except (KeyError, IndexError):
-                        LOGGER.info(f"Sync Worker Uploading missing node: {obj}")
-                        createNode(obj, node)
-                        break
-                
-                # Check if local file is newer
-                if node is not None and os.path.isfile(obj):
-                    modTime = os.path.getctime(obj)
-                    utcModTime = datetime.datetime.utcfromtimestamp(modTime)
-                    if node.date_modified < utcModTime:
-                        # Our file is newer, upload it
-                        LOGGER.info(f"Sync Worker Local file is newer: {obj}")
-                        modifyNode(obj, parentNode)
-                
-                if os.path.isdir(obj):
-                    # Add contained files/dir to queue
-                    for filename in os.listdir(obj):
-                        child = os.path.join(obj, filename)
-                        LOGGER.info(f"Sync Worker Adding to queue: {child}")
-                        syncQueue.put(child)
-            except Empty:
-                LOGGER.info(f"Sync queue is empty, restarting checks")
-                break
-            finally:
-                syncQueue.task_done()
-                time.sleep(1)
+            # We only want to split relative path
+            rel_path = str(obj).replace(str(root_path),"")
+            paths = list(filter(None, rel_path.split("/")))
+            LOGGER.debug(f"Sync Worker List of paths: {paths}")
+
+            node = root
+            parentNode = None
+            newNode = False
+            for path in paths:
+                try:
+                    # Node exists online, move on to the next
+                    parentNode = node
+                    node = node[path]
+                    continue
+                except (KeyError, IndexError):
+                    LOGGER.info(f"Sync Worker Uploading missing node: {obj}")
+                    createNode(obj, node)
+                    newNode = True
+                    break
+            
+            # Check if local file is newer
+            if not newNode and node is not None and os.path.isfile(obj):
+                fileTime = os.path.getmtime(obj)
+                fileTime = datetime.fromtimestamp(fileTime, timezone.utc)
+                nodeTime = node.date_modified.replace(tzinfo=timezone.utc)
+            
+                if nodeTime < fileTime:
+                    # Our file is newer, upload it
+                    LOGGER.info(f"Sync Worker Local file is newer: {obj}")
+                    LOGGER.info(f"node time: {nodeTime.strftime('%m/%d/%Y, %H:%M:%S %Z')}, local file : {fileTime.strftime('%m/%d/%Y, %H:%M:%S %Z')}")
+                    modifyNode(obj, parentNode)
+            
+            if os.path.isdir(obj):
+                # Add contained files/dir to queue
+                for filename in os.listdir(obj):
+                    child = os.path.join(obj, filename)
+                    LOGGER.debug(f"Sync Worker Adding to queue: {child}")
+                    syncQueue.put(child)
+        finally:
+            syncQueue.task_done()
+            # Remove lock
+            with lock:
+                if gotFileLock:
+                    lockedFiles.remove(obj)
+            time.sleep(1)
         
 def createNode (file_path, node):
 
@@ -180,24 +235,23 @@ def modifyNode (file_path, node):
             # Lets skip if file is empty, we can't upload 0 bytes files
             # We should catch it with the close write event
             if os.path.getsize(file_path) < 1:
-                LOGGER.debug(f"{file_path} was size 0 skipping")
+                LOGGER.info(f"{file_path} was size 0 skipping")
                 return
                 
             # Move original file to trash, then upload edited file
-            LOGGER.debug(f"Modify node deleting old: {filename}")
-            node[filename].delete()
+            LOGGER.info(f"Modify node deleting old: {filename}")
+            data = node[filename].delete()
+            LOGGER.info(f"Data {data}")
 
-            time.sleep(2)
+            time.sleep(30)
 
-            LOGGER.debug(f"Modify node uploading new: {file_path}")
+            LOGGER.info(f"Modify node uploading new: {file_path}")
             with open(file_path, 'rb') as file_in:
                 node.upload(file_in)
 
         except KeyError:
-            # Must be a new file
-            LOGGER.debug(f"Modify node old file not found, uploading: {file_path}")
-            with open(file_path, 'rb') as file_in:
-                node.upload(file_in)
+            # Log error if we can't find the file
+            LOGGER.error(f"Could not find the node for: {file_path}")
 
 def base(username, password):
     
@@ -223,29 +277,36 @@ def base(username, password):
                 print("Failed to request trust. You will likely be prompted for the code again in the coming weeks")
     
     try:
-        LOGGER.debug("Fetch root node details")
+        LOGGER.info("Fetch root node details")
         root = api.drive.root
 
-        LOGGER.debug(f"Watching: {root_path}")
+        LOGGER.info(f"Watching: {root_path}")
         wd = iNotice.add_watch(root_path, watch_flags)
         inotifyMap[wd] = (root, root_path)
         activeWatch.append(root_path)
 
-        # Add children to list
+        # Set up the download queue
         for child in root.get_children():
             LOGGER.debug(f"Adding to download list: icloud/{child.name}")
             downQueue.put((child, os.path.join(root_path, child.name)))
+        
+        # Set up the sync queue
+        for filename in os.listdir(root_path):
+            obj = os.path.join(root_path, filename)
+            syncQueue.put(obj)
 
     except PyiCloudAPIResponseException as error:
         LOGGER.error(error)
     
     threads = list()
-    # Add a download worker
-    task = threading.Thread(target=downloadWorker, daemon=True).start()
-    threads.append(task)
-    # Add a sync worker
-    task = threading.Thread(target=syncWorker, daemon=True, args=(root,)).start()
-    threads.append(task)
+    
+    for _ in range(maxThreads):
+        # Add a download worker
+        task = threading.Thread(target=downloadWorker, daemon=True).start()
+        threads.append(task)
+        # Add a sync worker
+        task = threading.Thread(target=syncWorker, daemon=True, args=(root,)).start()
+        threads.append(task)
 
     # Below we handle watching and syncing deleted changes in local folder
     while(True):
@@ -256,13 +317,20 @@ def base(username, password):
 
             # Add root children to the download queue
             for child in root.get_children():
-                LOGGER.debug("Download queue is empty, restarting....")
+                LOGGER.info("Download queue is empty, restarting....")
                 LOGGER.debug(f"Adding to download list: icloud/{child.name}")
                 downQueue.put((child, os.path.join(root_path, child.name)))
 
-        # Handle events of unblock after 15 mins so we can update the download queue
+        # If we finished with the sync queue restart it
+        if syncQueue.empty():
+            LOGGER.info("Sync queue is empty, restarting....")
+            for filename in os.listdir(root_path):
+                obj = os.path.join(root_path, filename)
+                syncQueue.put(obj)
+
+        # Handle events of unblock after 10 mins so we can update the download queue
         # with code above
-        for event in iNotice.read(timeout=900000, read_delay=1):
+        for event in iNotice.read(timeout=600000, read_delay=1):
             wd, _, _,  filename = event
             # Get the node information
             node, node_path = inotifyMap[wd]
@@ -275,7 +343,7 @@ def handleEvent(wd, all_flags, node, node_path, filename):
     """ Handle an inotify event"""
 
     for flag in all_flags:
-        LOGGER.debug(f"Event occurred: {str(flag)}")
+        LOGGER.info(f"Event occurred: {str(flag)}")
 
     try:
         if flags.DELETE in all_flags:
@@ -291,7 +359,7 @@ def handleEvent(wd, all_flags, node, node_path, filename):
         LOGGER.debug(f"{file_path} was already removed")
 
     except FileNotFoundError:
-        LOGGER.debug(f"{file_path} not found moving on.")
+        LOGGER.error(f"{file_path} not found moving on.")
 
 
 def main(args=None):
