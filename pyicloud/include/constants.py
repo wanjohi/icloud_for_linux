@@ -1,0 +1,1 @@
+DATA_TIMEOUT_S = 600 # Age of data before we consider it stale. Set to 600s == 10 mins

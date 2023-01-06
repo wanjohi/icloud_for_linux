@@ -7,10 +7,13 @@ import mimetypes
 import os
 import time
 from re import search
-from requests import Response
+from httpx import Response
 from uuid import uuid1
+from httpx import codes
+from shutil import copyfileobj
 
 from pyicloud.exceptions import PyiCloudAPIResponseException
+from pyicloud.include.constants import DATA_TIMEOUT_S
 
 
 LOGGER = logging.getLogger(__name__)
@@ -35,9 +38,9 @@ class DriveService:
                 return {"token": match.group(1)}
         raise Exception("Token cookie not found")
 
-    def get_node_data(self, node_id):
+    async def get_node_data(self, node_id):
         """Returns the node data."""
-        request = self.session.post(
+        request = await self.session.post(
             self._service_root + "/retrieveItemDetailsInFolders",
             params=self.params,
             data=json.dumps(
@@ -52,11 +55,11 @@ class DriveService:
         self._raise_if_error(request)
         return request.json()[0]
 
-    def get_file(self, file_id, **kwargs):
+    async def get_file(self, file_id, node_path):
         """Returns iCloud Drive file."""
         file_params = dict(self.params)
         file_params.update({"document_id": file_id})
-        response = self.session.get(
+        response = await self.session.get(
             self._document_root + "/ws/com.apple.CloudDocs/download/by_id",
             params=file_params,
         )
@@ -65,20 +68,29 @@ class DriveService:
         package_token = response_json.get("package_token")
         data_token = response_json.get("data_token")
         if data_token and data_token.get("url"):
-            return self.session.get(data_token["url"], params=self.params, **kwargs)
-        if package_token and package_token.get("url"):
-            return self.session.get(package_token["url"], params=self.params, **kwargs)
-        raise KeyError("'data_token' nor 'package_token'")
+            with open(node_path, 'wb') as file_out:
+                async with self.session.stream("GET", data_token["url"], params=self.params) as resp:
+                        async for chunk in resp.aiter_raw():
+                            file_out.write(chunk)
 
-    def get_app_data(self):
+        elif package_token and package_token.get("url"):
+            with open(node_path, 'wb') as file_out:
+                async with self.session.stream("GET", package_token["url"], params=self.params) as resp:
+                    async for chunk in resp.aiter_raw():
+                        file_out.write(chunk)
+        else:
+            raise KeyError("'data_token' nor 'package_token'")
+
+
+    async def get_app_data(self):
         """Returns the app library (previously ubiquity)."""
-        request = self.session.get(
+        request = await self.session.get(
             self._service_root + "/retrieveAppLibraries", params=self.params
         )
         self._raise_if_error(request)
         return request.json()["items"]
 
-    def _get_upload_contentws_url(self, file_object):
+    async def _get_upload_contentws_url(self, file_object):
         """Get the contentWS endpoint URL to add a new file."""
         content_type = mimetypes.guess_type(file_object.name)[0]
         if content_type is None:
@@ -93,7 +105,7 @@ class DriveService:
         file_params = self.params
         file_params.update(self._get_token_from_cookie())
 
-        request = self.session.post(
+        request = await self.session.post(
             self._document_root + "/ws/com.apple.CloudDocs/upload/web",
             params=file_params,
             headers={"Content-Type": "text/plain"},
@@ -107,9 +119,10 @@ class DriveService:
             ),
         )
         self._raise_if_error(request)
-        return (request.json()[0]["document_id"], request.json()[0]["url"])
+        data = request.json()
+        return (data[0]["document_id"], data[0]["url"])
 
-    def _update_contentws(self, folder_id, sf_info, document_id, file_object):
+    async def _update_contentws(self, folder_id, sf_info, document_id, file_object):
         data = {
             "data": {
                 "signature": sf_info["fileChecksum"],
@@ -138,7 +151,7 @@ class DriveService:
         if sf_info.get("receipt"):
             data["data"].update({"receipt": sf_info["receipt"]})
 
-        request = self.session.post(
+        request = await self.session.post(
             self._document_root + "/ws/com.apple.CloudDocs/update/documents",
             params=self.params,
             headers={"Content-Type": "text/plain"},
@@ -147,18 +160,18 @@ class DriveService:
         self._raise_if_error(request)
         return request.json()
 
-    def send_file(self, folder_id, file_object):
+    async def send_file(self, folder_id, file_object):
         """Send new file to iCloud Drive."""
-        document_id, content_url = self._get_upload_contentws_url(file_object)
+        document_id, content_url = await self._get_upload_contentws_url(file_object)
 
-        request = self.session.post(content_url, files={os.path.basename(file_object.name): file_object})
+        request = await self.session.post(content_url, files={os.path.basename(file_object.name): file_object})
         self._raise_if_error(request)
         content_response = request.json()["singleFile"]
-        self._update_contentws(folder_id, content_response, document_id, file_object)
+        await self._update_contentws(folder_id, content_response, document_id, file_object)
 
-    def create_folders(self, parent, name):
+    async def create_folders(self, parent, name):
         """Creates a new iCloud Drive folder"""
-        request = self.session.post(
+        request = await self.session.post(
             self._service_root + "/createFolders",
             params=self.params,
             headers={"Content-Type": "text/plain"},
@@ -177,9 +190,9 @@ class DriveService:
         self._raise_if_error(request)
         return request.json()
 
-    def rename_items(self, node_id, etag, name):
+    async def rename_items(self, node_id, etag, name):
         """Renames an iCloud Drive node"""
-        request = self.session.post(
+        request = await self.session.post(
             self._service_root + "/renameItems",
             params=self.params,
             data=json.dumps(
@@ -197,9 +210,9 @@ class DriveService:
         self._raise_if_error(request)
         return request.json()
 
-    def move_items_to_trash(self, node_id, etag):
+    async def move_items_to_trash(self, node_id, etag):
         """Moves an iCloud Drive node to the trash bin"""
-        request = self.session.post(
+        request = await self.session.post(
             self._service_root + "/moveItemsToTrash",
             params=self.params,
             data=json.dumps(
@@ -217,11 +230,10 @@ class DriveService:
         self._raise_if_error(request)
         return request.json()
 
-    @property
-    def root(self):
+    async def root(self):
         """Returns the root node."""
         if not self._root:
-            self._root = DriveNode(self, self.get_node_data("root"))
+            self._root = DriveNode(self, await self.get_node_data("root"), None)
         return self._root
 
     def __getattr__(self, attr):
@@ -231,9 +243,10 @@ class DriveService:
         return self.root[key]
 
     def _raise_if_error(self, response):  # pylint: disable=no-self-use
-        if not response.ok:
+        if response.status_code != codes.OK:
+            reason = response.reason_phrase(response.status_code)
             api_error = PyiCloudAPIResponseException(
-                response.reason, response.status_code
+                reason, response.status_code
             )
             LOGGER.error(api_error)
             raise api_error
@@ -242,10 +255,12 @@ class DriveService:
 class DriveNode:
     """Drive node."""
 
-    def __init__(self, conn, data):
+    def __init__(self, conn, data, parent):
         self.data = data
         self.connection = conn
         self._children = None
+        self.parent = parent
+        self._last_update = time.time()
 
     @property
     def name(self):
@@ -260,16 +275,29 @@ class DriveNode:
         node_type = self.data.get("type")
         return node_type and node_type.lower()
 
-    def get_children(self):
+    async def get_children(self):
         """Gets the node children."""
-        self.data.update(self.connection.get_node_data(self.data["docwsid"]))
+        # If data is stale, update
+        if self.age > DATA_TIMEOUT_S or not self._children:
+            await self.update()
+
         if "items" not in self.data:
             raise KeyError("No items in folder, status: %s" % self.data["status"])
         self._children = [
-            DriveNode(self.connection, item_data)
+            DriveNode(self.connection, item_data, self)
             for item_data in self.data["items"]
         ]
         return self._children
+    
+    async def update(self):
+        """Get updated node data."""
+        data = await self.connection.get_node_data(self.data["docwsid"])
+        self.data.update(data)
+        self._last_update = time.time()
+    
+    @property
+    def age(self):
+        return time.time() - self._last_update
 
     @property
     def size(self):
@@ -294,14 +322,12 @@ class DriveNode:
         """Gets the node last open date (in UTC)."""
         return _date_to_utc(self.data.get("lastOpenTime"))  # Folder does not have date
 
-    def open(self, **kwargs):
+    async def open(self, node_path):
         """Gets the node file."""
         # iCloud returns 400 Bad Request for 0-byte files
         if self.data["size"] == 0:
-            response = Response()
-            response.raw = io.BytesIO()
-            return response
-        return self.connection.get_file(self.data["docwsid"], **kwargs)
+            return
+        return await self.connection.get_file(self.data["docwsid"], node_path)
 
     def upload(self, file_object, **kwargs):
         """Upload a new file."""
@@ -314,27 +340,31 @@ class DriveNode:
             return None
         return [child.name for child in self.get_children()]
 
-    def mkdir(self, folder):
+    async def mkdir(self, folder):
         """Create a new directory directory."""
-        return self.connection.create_folders(self.data["drivewsid"], folder)
+        return await self.connection.create_folders(self.data["drivewsid"], folder)
 
-    def rename(self, name):
+    async def rename(self, name):
         """Rename an iCloud Drive item."""
-        return self.connection.rename_items(
+        return await self.connection.rename_items(
             self.data["drivewsid"], self.data["etag"], name
         )
 
-    def delete(self):
+    async def delete(self):
         """Delete an iCloud Drive item."""
-        return self.connection.move_items_to_trash(
+        response = await self.connection.move_items_to_trash(
             self.data["drivewsid"], self.data["etag"]
         )
 
-    def get(self, name):
+        # update the parent since this node doesn't exist anymore
+        await self.parent.update()
+        return response
+
+    async def get(self, name):
         """Gets the node child."""
         if self.type == "file":
             return None
-        return [child for child in self.get_children() if child.name == name][0]
+        return [child for child in await self.get_children() if child.name == name][0]
 
     def __getitem__(self, key):
         try:
